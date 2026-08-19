@@ -6,7 +6,7 @@ import librosa
 import numpy as np
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from transformers import Qwen2AudioForConditionalGeneration, AutoProcessor
+from transformers import Qwen2AudioForConditionalGeneration, AutoProcessor,AudioFlamingo3ForConditionalGeneration
 import torch
 import numpy
 import torch.nn as nn
@@ -22,73 +22,43 @@ from transformers.feature_extraction_utils import BatchFeature
 import logging
 from torch.optim import lr_scheduler
 
-def get_input_embeds(model, input_ids, input_features, feature_attention_mask, attention_mask, labels):
+MAX_SAMPLES = 16000 * 30
+
+def get_input_embeds(model, input_ids, input_features, input_features_mask, attention_mask, labels):
     # 1. Extract the input embeddings
+    def get_audio_features(
+        input_features: torch.FloatTensor,
+        input_features_mask: torch.Tensor,
+    ):
+        audio_output = model.model.audio_tower(input_features, input_features_mask=input_features_mask, return_dict=True)
+        audio_embeds = model.model.multi_modal_projector(audio_output.last_hidden_state)
+        input_lengths = input_features_mask.sum(-1).to(torch.long)
+        _, post_lengths = model.model.audio_tower._get_feat_extract_output_lengths(input_lengths)
+        valid_mask = torch.arange(audio_embeds.shape[1], device=post_lengths.device)[None, :] < post_lengths[:, None]
+        audio_output.pooler_output = audio_embeds[valid_mask.to(audio_embeds.device)]
+
+        return audio_output
+
+
     inputs_embeds = model.get_input_embeddings()(input_ids)
-
-
-    # 2. Merge text and audios
-    if input_features is not None and input_ids.shape[1] != 1:
-        audio_feat_lengths, audio_output_lengths = model.model.audio_tower._get_feat_extract_output_lengths(
-            feature_attention_mask.sum(-1)
-        )
-        # Print intermediate values:
-        # print(f"feature_attention_mask.sum(-1): {feature_attention_mask.sum(-1)}")
-        # print(f"audio_feat_lengths: {audio_feat_lengths}")
-        # print(f"audio_output_lengths (from _get_feat_extract_output_lengths): {audio_output_lengths}")
-        batch_size, _, max_mel_seq_len = input_features.shape
-        max_seq_len = (max_mel_seq_len - 2) // 2 + 1
-        # Create a sequence tensor of shape (batch_size, max_seq_len)
-        seq_range = (
-            torch.arange(0, max_seq_len, dtype=audio_feat_lengths.dtype, device=audio_feat_lengths.device)
-            .unsqueeze(0)
-            .expand(batch_size, max_seq_len)
-        )
-        lengths_expand = audio_feat_lengths.unsqueeze(1).expand(batch_size, max_seq_len)
-        # Create mask
-        padding_mask = seq_range >= lengths_expand
-
-        audio_attention_mask_ = padding_mask.view(batch_size, 1, 1, max_seq_len).expand(
-            batch_size, 1, max_seq_len, max_seq_len
-        )
-        audio_attention_mask = audio_attention_mask_.to(
+    if input_features is not None and input_ids is not None:
+        input_features = input_features.to(
             dtype=model.model.audio_tower.conv1.weight.dtype, device=model.model.audio_tower.conv1.weight.device
         )
-        audio_attention_mask[audio_attention_mask_] = float("-inf")
-        # audio_attention_mask = torch.ones(batch_size,max_seq_len )
-        # print(input_features.shape, flush=True)
-        # print(audio_attention_mask.shape, flush=True)
-        audio_outputs = model.model.audio_tower(input_features, attention_mask=audio_attention_mask.to("cuda:0"))
-        selected_audio_feature = audio_outputs.last_hidden_state
-        # print(f"selected_audio_feature.shape: {selected_audio_feature.shape}")
-        audio_features = model.model.multi_modal_projector(selected_audio_feature)
-        # print(f"audio_features (after projection) shape: {audio_features.shape}") # This is the one you already printed.
-        # print(f"Shape of audio_features: {audio_features.shape}")
-        # print(f"Value of audio_output_lengths: {audio_output_lengths}")
-        # print(f"Shape of audio_output_lengths: {audio_output_lengths.shape}")
-        # print(f"Shape of inputs_embeds: {inputs_embeds.shape}")
-        # print(f"Shape of attention_mask: {attention_mask.shape}")
-        # print(f"Shape of audio_attention_mask: {audio_attention_mask.shape}")
+        input_features_mask = input_features_mask.to(
+            dtype=model.model.audio_tower.conv1.weight.dtype, device=model.model.audio_tower.conv1.weight.device
+        )
+        audio_embeds = get_audio_features(input_features, input_features_mask).pooler_output
 
-        # inputs_embeds, attention_mask, labels, position_ids, _ = model._merge_input_ids_with_audio_features(
-        #     audio_features, audio_output_lengths, inputs_embeds, input_ids, attention_mask, labels
-        # )
+        # replace text-audio token placeholders with audio embeddings
+        special_audio_mask = model.model.get_placeholder_mask(
+            input_ids, inputs_embeds=inputs_embeds, audio_features=audio_embeds
+        )
+        inputs_embeds = inputs_embeds.masked_scatter(
+            special_audio_mask, audio_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        )
 
-        num_audios, max_audio_tokens, embed_dim = audio_features.shape
-        audio_features_mask = torch.arange(max_audio_tokens, device=audio_output_lengths.device)[None, :]
-        audio_features_mask = audio_features_mask < audio_output_lengths[:, None]
-        audio_features = audio_features[audio_features_mask]
-        n_audio_tokens = (input_ids == model.config.audio_token_id).sum().item()
-        n_audio_features = audio_features.shape[0]
-
-        if n_audio_tokens != n_audio_features:
-            raise ValueError(
-                f"Audio features and audio tokens do not match: tokens: {n_audio_tokens}, features {n_audio_features}"
-            )
-        special_audio_mask = (input_ids == model.config.audio_token_id).to(inputs_embeds.device)
-        special_audio_mask = special_audio_mask.unsqueeze(-1).expand_as(inputs_embeds)
-        audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
-        inputs_embeds = inputs_embeds.masked_scatter(special_audio_mask, audio_features)
+    
     return inputs_embeds
 
 def qwen_eval_gen(audio_list, processor, model):
@@ -97,13 +67,11 @@ def qwen_eval_gen(audio_list, processor, model):
     audio_url = "file:" + audio_list[0]
     conversation = [
         {"role": "user", "content": [
-            {"type": "audio", "audio_url": None},
+            {"type": "audio", "audio_url": audio_url},
         ]},
     ]
     text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
-
     print(text)
-
     audios = []
     for message in conversation:
         if isinstance(message["content"], list):
@@ -119,7 +87,7 @@ def qwen_eval_gen(audio_list, processor, model):
     audios = torch.cat(audios).unsqueeze_(0)
 
     # Inference
-    inputs = processor(text=text, audios=audios, return_tensors="pt", padding=True, sampling_rate=16000)
+    inputs = processor(text=text, audio=audios, return_tensors="pt" , sampling_rate=16000)
     inputs = {k: v.to("cuda") if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
     generate_ids = model.generate(**inputs, max_length=1024, do_sample=False, temperature=0.0, top_p=0, top_k=0)
     generate_ids = generate_ids[:, inputs['input_ids'].size(1):]
@@ -139,12 +107,6 @@ def get_adv_targets(text, targets, model, processor, audios):
                            sampling_rate=16000)
         inputs["input_ids"] = inputs["input_ids"].to("cuda")
         inputs["attention_mask"] = inputs["attention_mask"].to("cuda")
-        # model_inputs = model.prepare_inputs_for_generation(**inputs)
-
-        # inputs_embeds = get_input_embeds(model, model_inputs["input_ids"], model_inputs["input_features"],
-        #                                  model_inputs["feature_attention_mask"], model_inputs["attention_mask"], None)
-
-        # output = model(model_inputs, inputs_embeds=inputs_embeds)
         output = model(model_inputs, inputs_embeds=inputs_embeds)
         logits = output.logits
         # Shift logits so token n-1 predicts token n
@@ -198,19 +160,11 @@ def differentiableWhisper(raw_speech, feature_extractor, truncation: bool = True
             yielding results similar to cpu computing with 1e-5 tolerance.
             """
             # waveform = torch.from_numpy(waveform).type(torch.float32)
-
             window = torch.hann_window(extractor.n_fft).to("cuda")
-            # if device != "cpu":
-            #     waveform = waveform.to(device)
-            #     window = window.to(device)
             stft = torch.stft(waveform, extractor.n_fft, feature_extractor.hop_length, window=window, return_complex=True,pad_mode="constant")
             magnitudes = stft[..., :-1].abs() ** 2
-
             mel_filters = torch.from_numpy(extractor.mel_filters).type(torch.float32).to("cuda")
-            # if device != "cpu":
-            #     mel_filters = mel_filters.to(device)
             mel_spec = mel_filters.T @ magnitudes
-
             log_spec = torch.clamp(mel_spec, min=1e-10).log10()
             if waveform.dim() == 2:
                 max_val = log_spec.max(dim=2, keepdim=True)[0].max(dim=1, keepdim=True)[0]
@@ -218,8 +172,6 @@ def differentiableWhisper(raw_speech, feature_extractor, truncation: bool = True
             else:
                 log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
             log_spec = (log_spec + 4.0) / 4.0
-            # if device != "cpu":
-            #     log_spec = log_spec.detach().cpu()
             return log_spec
 
         extract_fbank_features = (
@@ -262,16 +214,6 @@ def qwen_jailbreak_gen(index, audio_list, processor, model, audio_save_path, num
     ]
     text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
 
-    # print(text)
-    # TODO: also include prompts that test whether Audio 1 sounds natural or not
-    # conversation_judge = [
-    #     {"role": "user", "content": [
-    #         {"type": "text", "text": "Listen to Audio 1 and judge whether Audio 1 contains car horn?"},
-    #         {"type": "audio", "audio_url": audio_url},
-    #         {"type": "text", "text": "Does Audio 1 contain car horn?"},
-    #     ]},
-    # ]
-    # text_judge = processor.apply_chat_template(conversation_judge, add_generation_prompt=True, tokenize=False)
     
     audios = []
     for message in conversation:
@@ -280,47 +222,21 @@ def qwen_jailbreak_gen(index, audio_list, processor, model, audio_save_path, num
                 if ele["type"] == "audio":
                     audios.append(librosa.load(
                         BytesIO(urlopen(ele['audio_url']).read()),
-                        sr=processor.feature_extractor.sampling_rate)[0]
+                        sr=processor.feature_extractor.sampling_rate)[0][:MAX_SAMPLES]
                                   )
                     # print(processor.feature_extractor.sampling_rate)
-
-    # Inference
-    # inputs = processor(text=text, audios=audios, return_tensors="pt", padding=True, sampling_rate=16000)
-    # inputs = {k: v.to("cuda") if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-    # generate_ids = model.generate(**inputs, max_length=1024, do_sample=False, temperature=0.0, top_p=0, top_k=0)
-    # generate_ids = generate_ids[:, inputs['input_ids'].size(1):]
-    # response = processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-    # return response
-
-    # Grad based attack
-    # target_text = " Sure! These are step-by-step instructions"
-    # target_text = get_adv_targets(text, targets, model, processor, audios)
-    # target_text = "Sure"
-
     # Load the CSV file
     file_path = 'harmful_behaviors.csv'  # Replace with the path to your CSV file
     data = pd.read_csv(file_path)
     for i, row in data.iterrows():
         row = row.to_dict()
-        # print(f"Row {index}: {row}")  # Prints row as a dictionary
         if i == index:
-        # if row['goal'] == ori_prompt:
             target_text =  "<think> </think> <answer> "+ row['target']
-            
-            # Sure, here is"
-            # +row['target']
-            # + "<answer> Sure"
-    # exit()
 
-    print(f'Target response: {target_text}')
+    # print(f'Target response: {target_text}')
 
     target_ids = processor(text=target_text, return_tensors="pt")["input_ids"].to("cuda")
 
-    # if advnoise_control:
-    #     model_judge = model
-    # if model_judge:
-    #     target_text_judge = "Yes"
-    #     target_ids_judge = processor(text=target_text_judge, return_tensors="pt", padding=True)["input_ids"].to("cuda")
 
     adv_length = num_token_suffix
     std = 0.01
@@ -358,53 +274,52 @@ def qwen_jailbreak_gen(index, audio_list, processor, model, audio_save_path, num
         audios_here = torch.cat(audios_here).unsqueeze_(0)
         # print(audios_here)
         audios_here.requires_grad_(True)
-        # print(audios_here.cpu())
-        # audios[:,-adv_length:] = adv_audio_suffix
         # print(audios_here.shape)
-        
-        inputs = processor(text=text + target_text, audio=audios_here.detach().cpu().numpy(), return_tensors="pt", padding=True, sampling_rate=16000)
+        inputs = processor(text=text + target_text, audio=audios_here[0].detach().cpu().numpy(), return_tensors="pt", sampling_rate=16000)
         # print(inputs)
         inputs["input_ids"] = inputs["input_ids"].to("cuda")
         # print(inputs["input_ids"])
         inputs["attention_mask"] = inputs["attention_mask"].to("cuda")
-        inputs["feature_attention_mask"] = inputs["feature_attention_mask"].to("cuda")
-        # inputs["labels"] = inputs["labels"].to("cuda")
-        
-        # process the input feature
-        # import ProcessingKwargs
-        # class Qwen2AudioProcessorKwargs(ProcessingKwargs, total=False):
-        #     _defaults = {
-        #         "text_kwargs": {
-        #             "padding": False,
-        #         },
-        #         "audio_kwargs": {},
-        #     }
-        # output_kwargs = self._merge_kwargs(
-        #     Qwen2AudioProcessorKwargs,
-        #     tokenizer_init_kwargs=processor.tokenizer.init_kwargs,
-        #     **kwargs,
-        # )
-        # output_kwargs["audio_kwargs"]["return_attention_mask"] = True
-        # output_kwargs["audio_kwargs"]["padding"] = "max_length"
-        print(torch.norm(inputs["input_features"]), flush=True)
-        print(inputs["input_features"].shape, flush=True)
+        inputs["input_features_mask"] = inputs["input_features_mask"].to("cuda")
 
+        # print(torch.norm(inputs["input_features"]), flush=True)
+        # print(inputs["input_features"].shape, flush=True)
+
+
+        
+        # window_size = int(16000* processor.feature_extractor.chunk_length)
+      
+
+        # per_sample_windows: list[int] = []
+        # flat_chunks: list[np.ndarray] = []
+        # for audio_el in audios_here:
+        #     n_samples = int(audio_el.shape[0])
+        #     n_win = max(1, (n_samples + window_size - 1) // window_size)
+        #     per_sample_windows.append(n_win)
+
+        #     time_cap = min(n_samples, n_win * window_size)
+        #     for i in range(n_win):
+        #         start = i * window_size
+        #         end = min((i + 1) * window_size, time_cap)
+        #         flat_chunks.append(audio_el[start:end])
+
+        # # print(processor.feature_extractor)
+        # print(flat_chunks)
         differentiable_inputs = differentiableWhisper(audios_here, processor.feature_extractor)
-        
-
         # print(audio_inputs)
         inputs["input_features"] = differentiable_inputs ["input_features"]
         inputs["input_features"] = inputs["input_features"].to("cuda")
-
         print(torch.norm(inputs["input_features"]), flush=True)
         print(inputs["input_features"].shape, flush=True)
-        # print(inputs["input_features"] .shape)
-        # print(inputs["input_ids"] .shape)
-        # model_inputs = model.prepare_inputs_for_generation(**inputs)
         with torch.no_grad():
             inputs_embeds = get_input_embeds(model.to("cuda"), inputs["input_ids"], inputs["input_features"],
-                                            inputs["feature_attention_mask"], inputs["attention_mask"], None)
+                                            inputs["input_features_mask"], inputs["attention_mask"], None)
         model = model.to("cuda")
+        inputs = {
+            k: v.to(device=model.device, dtype=model.dtype) if torch.is_floating_point(v) 
+            else v.to(device=model.device)
+            for k, v in inputs.items()
+        }
         output = model(**inputs,output_attentions=True)
         averaged_tensor= 0
         for i in range(len(output.attentions)):
@@ -421,9 +336,7 @@ def qwen_jailbreak_gen(index, audio_list, processor, model, audio_save_path, num
         shift_labels = target_ids
         loss = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
-        # print(f"adv_audio_suffix.requires_grad: {adv_audio_suffix.requires_grad}")
-        # print(f"loss.requires_grad: {loss.requires_grad}") # loss should also require grad
-        # grad1 = torch.autograd.grad(outputs=[loss], inputs=[adv_audio_suffix])[0]
+
         try:
             loss.backward()
         except RuntimeError as e:
@@ -433,26 +346,7 @@ def qwen_jailbreak_gen(index, audio_list, processor, model, audio_save_path, num
 
         # adv_audio_suffix.grad = grad1
         loss2 = None
-        # # get advnoise control gradient
-        # if advnoise_control:
-        #     inputs = processor(text=text_judge + target_text_judge, audios=audios_here, return_tensors="pt", padding=True, sampling_rate=16000)
-        #     inputs["input_ids"] = inputs["input_ids"].to("cuda")
-        #     inputs["attention_mask"] = inputs["attention_mask"].to("cuda")
-        #     model_inputs = model_judge.prepare_inputs_for_generation(**inputs)
-        #     inputs_embeds = get_input_embeds(model_judge, model_inputs["input_ids"], model_inputs["input_features"], model_inputs["feature_attention_mask"], model_inputs["attention_mask"],None)
-        #     output = model_judge(model_inputs, inputs_embeds=inputs_embeds)
-        #     logits = output.logits
-        #     shift = inputs_embeds.shape[1] - target_ids_judge.shape[1]
-        #     shift_logits = logits[..., shift - 1:-1, :].contiguous()  # (1, num_target_ids, vocab_size)
-        #     shift_labels = target_ids_judge
-        #     loss2 = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        #     grad2 = torch.autograd.grad(outputs=[loss2], inputs=[adv_audio_suffix])[0]
-        #     adv_audio_suffix.grad += grad2
-
         optimizer.step()
-        # scheduler.step()
-        # print(f'min value: {adv_audio_suffix.min()}; max value: {adv_audio_suffix.max()}')
-        # adv_audio_suffix = adv_audio_suffix.clamp(-1.0, 1.0)
         norm_val = torch.norm(adv_audio_suffix) # Calculates the L2 norm
         max_norm = 10
         if norm_val >= max_norm:
@@ -471,13 +365,7 @@ def qwen_jailbreak_gen(index, audio_list, processor, model, audio_save_path, num
         #     break
 
 
-        # inputs_embeds[:,:shift,:] = inputs_embeds[:,:shift,:] - lr * grad[:,:shift,:]
 
-    # inputs_ori = processor(text=text, audios=audios, return_tensors="pt", padding=True, sampling_rate=16000)
-    # inputs_ori = {k: v.to("cuda") if isinstance(v, torch.Tensor) else v for k, v in inputs_ori.items()}
-    # generate_ids = model.generate(inputs_embeds=inputs_embeds[:,:shift,:], max_length=1024, do_sample=False, temperature=0.0, top_p=0, top_k=0)
-    # generate_ids = generate_ids[:, inputs_ori['input_ids'].size(1):]
-    # response = processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
     if len(losses)>0:
         print("final loss {}".format(losses[-1]))
     audios_here = audios_original.copy()
@@ -506,11 +394,8 @@ class DataTrainingArguments:
 
 
 def train_adv(model_name,data_args, begin_index, end_index):
-    # model = Qwen2AudioForConditionalGeneration.from_pretrained(data_args.model_name_or_path,torch_dtype=torch.bfloat16)
-    from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
-    # from attn_visual import qwen2_forward
-    # Qwen2Attention.forward = qwen2_forward
-    model = Qwen2AudioForConditionalGeneration.from_pretrained(data_args.model_name_or_path,torch_dtype=torch.bfloat16,attn_implementation="eager")
+
+    model = AudioFlamingo3ForConditionalGeneration.from_pretrained(data_args.model_name_or_path,torch_dtype=torch.bfloat16,attn_implementation="eager")
     
     
     processor = AutoProcessor.from_pretrained(data_args.model_name_or_path)
@@ -522,7 +407,8 @@ def train_adv(model_name,data_args, begin_index, end_index):
     for id, audio_clip in tqdm(enumerate(audio_list)):
         if begin_index<=id<end_index:
             response, record= qwen_jailbreak_gen(id, [audio_list[id]], processor, model, "../../data/advbench/advwave/"+model_name+"_"+str(data_args.num_token_suffix)+"_"+str(data_args.num_epochs)+"/"+ str(id)+".wav", data_args.num_token_suffix, data_args.num_epochs)
-        # print(response)
+            # response= qwen_eval_gen([audio_list[id]], processor, model)
+            # print(response)
         
 def hf_save_adv(model_name, data_args, begin_index, end_index):
     from datasets import load_dataset
@@ -546,7 +432,7 @@ def hf_save_adv(model_name, data_args, begin_index, end_index):
             waveform = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)(waveform)[0].numpy()
         else:
             waveform = waveform.squeeze(0).numpy()
-        data.append({"prompt": instructions[i], "audio": {"array": waveform, "sampling_rate": 16000},"dataset_name": "advwave"})
+        data.append({"prompt": instructions[i], "audio": {"array": waveform[:MAX_SAMPLES], "sampling_rate": 16000},"dataset_name": "advwave"})
 
     dataset = Dataset.from_list(data).cast_column("audio", Audio())
     dataset.push_to_hub(model_name + "_advwave_"+str(data_args.num_token_suffix)+"_"+str(data_args.num_epochs))
@@ -589,7 +475,7 @@ if __name__ == "__main__":
     if last_slash_index != -1:
         model_name = data_args.model_name_or_path[last_slash_index + 1:]
     begin_index = 0
-    end_index = 10
+    end_index = 80
     import random
     import numpy as np 
     seed=0
@@ -602,7 +488,6 @@ if __name__ == "__main__":
     torch.use_deterministic_algorithms(True)
 
     train_adv(model_name, data_args,  begin_index,end_index)
-
     hf_save_adv(model_name, data_args, begin_index, end_index)
 
     # hf_save_original()

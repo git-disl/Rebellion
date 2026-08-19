@@ -9,28 +9,32 @@
 
 module load anaconda3/2023.03
 module load gcc/12.3.0
-source activate audio
+module load ffmpeg
+source activate hts
 
 # model_path=${1:-../ckpt/Qwen2-Audio-7B-Instruct_mixture_1_mixture_0}
- model_path=${1:-../ckpt/Qwen2-Audio-7B-Instruct_mixture_0_non_cot}
+#  model_path=${1:-../ckpt/Qwen2-Audio-7B-Instruct_mixture_0_non_cot}
 # model_path=${1:-../ckpt/Qwen2-Audio-7B-Instruct_mixture_0.5}
 # model_path=${1:-../ckpt/Qwen2-Audio-7B-Instruct_mixture_1}
 # model_path=${1:-../ckpt/Qwen2-Audio-7B-Instruct_mixture_0}
 # model_path=${1:-mispeech/r1-aqa}
 # model_path=${1:-Qwen/Qwen2-Audio-7B-Instruct}
-# model_path=${1:-zhifeixie/Audio-Reasoner} 
+# model_path=${1:-zhifeixie/Audio-Reasoner}
+# model_path=nvidia/audio-flamingo-3-hf
+# model_path=${1:-ckpt/audio-flamingo-3-hf_sft_mixture_0.5}
+model_path=ckpt/audio-flamingo-3-hf_noise2_10_0.5 
 path_after_slash=$(basename "$model_path") 
 echo "The short model path is: $path_after_slash"
 
-cd  ../../                            # Change to working directory
+cd  ../../                               # Change to working directory
 
-cd mmlu  
-
-CUDA_VISIBLE_DEVICES=0 python pred.py \
+CUDA_VISIBLE_DEVICES=0 python pred_vllm.py \
 	--model_dir ${model_path} \
 	--data_dir anonymous4486/audio_mmlu_high_school_biology \
-	--output_dir ../data/mmlu/result/biology/${path_after_slash} \
-	--reward_format cot
+	--output_dir data/mmlu/result/biology/${path_after_slash} 
 
+
+
+cd eval/gsm8k  
 CUDA_VISIBLE_DEVICES=0 python eval.py \
-	--input_path ../data/mmlu/result/biology/${path_after_slash}
+	--input_path ../../data/mmlu/result/biology/${path_after_slash}

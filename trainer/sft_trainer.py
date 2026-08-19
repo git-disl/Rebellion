@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import transformers
 from accelerate import PartialState
-from datasets import Dataset, IterableDataset
+from datasets import Dataset, IterableDataset,DatasetDict
 from packaging import version
 from transformers import (
     AutoModelForCausalLM,
@@ -29,7 +29,72 @@ from transformers import (
     TrainingArguments,
     is_wandb_available,
 )
-from trl.data_utils import truncate_dataset
+import pyarrow
+import pyarrow.compute as pc
+from typing import Any, TypeVar
+DatasetType = TypeVar("DatasetType", Dataset, DatasetDict)
+
+def truncate_dataset(dataset: DatasetType, max_length: int, map_kwargs: dict[str, Any] | None = None) -> DatasetType:
+    r"""
+    Truncate sequences in a dataset to a specified `max_length`.
+
+    Args:
+        dataset ([`~datasets.Dataset`] or [`~datasets.DatasetDict`]):
+            Dataset to truncate.
+        max_length (`int`):
+            Maximum sequence length to truncate to.
+        map_kwargs (`dict`, *optional*):
+            Additional keyword arguments to pass to the dataset's map method when truncating examples.
+
+    Returns:
+        [`~datasets.Dataset`] or [`~datasets.DatasetDict`]: The dataset with truncated sequences.
+
+    Example:
+    ```python
+    >>> from datasets import Dataset
+
+    >>> examples = {
+    ...     "input_ids": [[1, 2, 3], [4, 5, 6, 7], [8]],
+    ...     "attention_mask": [[0, 1, 1], [0, 0, 1, 1], [1]],
+    ... }
+    >>> dataset = Dataset.from_dict(examples)
+    >>> truncated_dataset = truncate_dataset(dataset, max_length=2)
+    >>> truncated_dataset[:]
+    {'input_ids': [[1, 2], [4, 5], [8]],
+     'attention_mask': [[0, 1], [0, 0], [1]]}
+    ```
+    """
+    if map_kwargs is None:
+        map_kwargs = {}
+    if isinstance(dataset, Dataset):
+        # Fast truncation with pyarrow
+        def truncate(examples):
+            truncated_columns = []
+            for column in examples.columns:
+                if pyarrow.types.is_list(column.type) or pyarrow.types.is_large_list(column.type):
+                    column = pc.list_slice(column, 0, max_length)
+                truncated_columns.append(column)
+            return pyarrow.Table.from_arrays(truncated_columns, names=examples.column_names)
+
+        dataset = dataset.with_format("arrow")
+        dataset = dataset.map(truncate, batched=True, **map_kwargs)
+        dataset = dataset.with_format(None)
+    else:
+
+        def truncate(examples):
+            truncated_examples = {}
+            for key, column in examples.items():
+                if column and isinstance(column[0], list):
+                    column = [val[:max_length] for val in column]
+                truncated_examples[key] = column
+            return truncated_examples
+
+        dataset = dataset.map(
+            truncate,
+            batched=True,
+            **map_kwargs,
+        )
+    return dataset
 
 def _get_audio(example):
     audio = example["audio"]
@@ -44,34 +109,38 @@ def _get_audio(example):
 def _get_message( example, for_generation=False):
     question_template = f"Based on the given audio, answer the speaker's question. Please think about this question as if you were a human pondering deeply. It's encouraged to include self-reflection or verification in the reasoning process. Output the thinking process in <think> </think> and final answer in <answer> </answer>."
     # print(question_template)
+    MAX_SAMPLES = 16000 * 30
     if "response" in example.keys() and not for_generation:
         if  example["dataset_name"]=="safety":
             message = [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "audio", "audio_url": None},
                         {"type": "text", "text": question_template},
+                        {"type": "audio", "audio": example["audio"]["array"][:MAX_SAMPLES],"sampling_rate": example["audio"]["sampling_rate"]},
+                        
                     ],
                 },
+                {   "role": "assistant", 
+                    "content": [{"type": "text", "text": example["response"]}]
+                }
                 # {"role": "assistant", 
-                # "content": example["response"]}
-                {"role": "assistant", 
-                "content": "sorry, "}
+                # "content": "sorry, "}
             ]
         else:
             message = [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "audio", "audio_url": None},
                         {"type": "text", "text": question_template},
+                        {"type": "audio", "audio": example["audio"]["array"][:MAX_SAMPLES],"sampling_rate": example["audio"]["sampling_rate"]},
                     ],
                 },
-                # {"role": "assistant", 
-                # "content": example["response"]}
                 {"role": "assistant", 
-                "content":"sure, "}
+                "content": [{"type": "text", "text": example["response"]}],
+                }
+                # {"role": "assistant", 
+                # "content":"sure, "}
                 # {"role": "assistant", 
                 # "content": "sorry, "}
             ]
@@ -94,24 +163,35 @@ def _get_message( example, for_generation=False):
 
 def tokenize(example, processing_class, dataset_text_field, add_special_tokens,for_generation):
     # print(example["prompt"])
-    text = _get_message(example,for_generation =for_generation )
-    
-    chat_text = processing_class.apply_chat_template(text , add_generation_prompt=for_generation, tokenize=False)
+    text = _get_message(example, for_generation =for_generation )
 
-    # print(chat_text)
-    # print("hihi{}".format(chat_text))
-    # print(processing_class)
-    processed = processing_class(
-        text=chat_text, 
-        audio=_get_audio(example),
-        sampling_rate=16000,
-        return_tensors="pt",
-        padding=True
+    # chat_text = processing_class.apply_chat_template(text , add_generation_prompt=for_generation, tokenize=False)
+
+    # processed = processing_class(
+    #     text=chat_text, 
+    #     audio=_get_audio(example),
+    #     sampling_rate=16000,
+    #     return_tensors="pt",
+    #     padding=True
+    # )
+
+    processed = processing_class.apply_chat_template(
+        text,
+        tokenize=True,
+        add_generation_prompt=for_generation,
+        return_dict=True,
+        output_labels=True,
     )
+
+    if "feature_attention_mask" in processed:
+        mask_name = "feature_attention_mask"
+    elif "input_features_mask" in processed:
+        mask_name = "input_features_mask"
+
     processed["input_ids"] = processed["input_ids"][0]
     processed["attention_mask"] = processed["attention_mask"][0]
     processed["input_features"] = processed["input_features"][0]
-    processed["feature_attention_mask"] = processed["feature_attention_mask"][0]
+    processed[mask_name] = processed[mask_name][0]
     processed["dataset_name"] = example["dataset_name"]
     return processed
 
@@ -309,7 +389,7 @@ class AudioSFTTrainer(SFTTrainer):
 
         return dataset
     
-    def loss_func(self, model_output, labels,dataset_names, num_items_in_batch,weighted=True):
+    def loss_func(self, model_output, labels, num_items_in_batch,weighted=True):
         # Shift so that tokens < n predict n
         logits = model_output["logits"] if isinstance(model_output, dict) else model_output[0]
         
@@ -336,26 +416,6 @@ class AudioSFTTrainer(SFTTrainer):
         
         # Take the mean over the label dimensions, then divide by the number of active elements (i.e. not-padded):
         num_active_elements = padding_mask.numel() - padding_mask.long().sum()
-        # weights = []
-        # for dataset_name in dataset_names:
-        #     if dataset_name == "safety":
-        #         if weighted== True:
-        #             weights+= [self.safety_mixture]
-        #         else:
-        #             weights+= [1]
-        #     elif dataset_name == "gsm8k" or dataset_name == "alpaca":
-        #         if weighted== True:
-        #             weights += [1-self.safety_mixture]
-        #         else:
-        #             weights += [1]
-        #     else:
-        #         weights += [1]
-        #     # print(weights)
-        # weights= torch.tensor(weights)
-   
-        # for i in range(nll_loss.shape[0]):
-        #     nll_loss[i]*= weights[i]
-        #     smoothed_loss[i]*= weights[i]
        
         nll_loss = nll_loss.sum() / num_active_elements
         smoothed_loss = smoothed_loss.sum() / (num_active_elements * log_probs.shape[-1])
@@ -427,7 +487,7 @@ class AudioSFTTrainer(SFTTrainer):
         # labels = inputs.pop("labels")
         # torch.set_printoptions(threshold=10000, linewidth=200, edgeitems=50) # Adjust values as needed
         # print(inputs["input_ids"], flush=True)
-        dataset_name = inputs.pop("dataset_name")
+        # dataset_name = inputs.pop("dataset_name")
         if self.model_accepts_loss_kwargs:
             loss_kwargs = {}
             if num_items_in_batch is not None:
@@ -446,8 +506,7 @@ class AudioSFTTrainer(SFTTrainer):
         # else:
         model_name = unwrapped_model._get_name()
         # User-defined compute_loss function
-        loss = self.loss_func(outputs, inputs["labels"], dataset_name, num_items_in_batch=num_items_in_batch, weighted=weighted)
-        inputs["dataset_name"] = dataset_name
+        loss = self.loss_func(outputs, inputs["labels"], num_items_in_batch=num_items_in_batch, weighted=weighted)
 
 
         if (

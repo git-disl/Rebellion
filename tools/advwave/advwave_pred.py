@@ -3,7 +3,7 @@ from absl import app
 from absl import flags
 from absl import logging
 import torch
-from transformers import AutoProcessor, HfArgumentParser, Qwen2AudioForConditionalGeneration
+from transformers import AutoProcessor, HfArgumentParser, Qwen2AudioForConditionalGeneration,AudioFlamingo3ForConditionalGeneration
 import json
 from dataclasses import dataclass, field
 import torchaudio
@@ -57,7 +57,7 @@ def _get_message(obj_dict):
         {
             "role": "user",
             "content": [
-                {"type": "audio", "audio_url": obj_dict['audio']["path"]},
+                {"type": "audio", "audio_url": None},
                 {"type": "text", "text": question_template},
             ],
         }
@@ -86,7 +86,8 @@ def main(_):
     print(f"CUDA available: {torch.cuda.is_available()}")
     audio_processor = AutoProcessor.from_pretrained(_MODEL_DIR.value)
     # logging.info("hihiaa")
-    audio_model = Qwen2AudioForConditionalGeneration.from_pretrained(_MODEL_DIR.value).to(device)
+    # audio_model = Qwen2AudioForConditionalGeneration.from_pretrained(_MODEL_DIR.value).to(device)
+    audio_model = AudioFlamingo3ForConditionalGeneration.from_pretrained(_MODEL_DIR.value).to(device)
     all_outputs = []
     # logging.info("sssssas")
 
@@ -108,8 +109,8 @@ def main(_):
         # if example["id"] not in data_id and example["target_model"] = 'Qwen2-Audio':
         if "JALMBench" not in _ADVWAVE_DATA.value or example["target_model"] == 'Qwen2-Audio' :
             # data_id+=[example["id"]]
-            example["instruction"] = example["original_text"]
-            del example['original_text']
+            example["instruction"] = example["prompt"]
+            del example['prompt']
             if example["audio"]!= None:
                 datas += [example]
     
@@ -129,17 +130,18 @@ def main(_):
             for msg in batch_messages
         ]
         inputs = audio_processor(
-            text=text, audios=batch_audios, sampling_rate=16000, return_tensors="pt", padding=True
+            text=text, audio=batch_audios, sampling_rate=16000, return_tensors="pt"
         ).to(audio_model.device)
+        inputs = {k: v.to(device=audio_model.device, dtype=audio_model.dtype) if torch.is_floating_point(v) else v.to(audio_model.device) for k, v in inputs.items()}
         generated_ids = audio_model.generate(**inputs, max_new_tokens=2048)
-        generated_ids = generated_ids[:, inputs.input_ids.size(1) :]
+        generated_ids = generated_ids[:, inputs["input_ids"].size(1) :]
         batch_response = audio_processor.batch_decode(
             generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )
         
         for j in range(len(batch_response)):
             dictionary={}
-            dictionary['instruction']= batch_data[j]['instruction']
+            dictionary['prompt']= batch_data[j]['instruction']
             dictionary['full_output'] = batch_response[j]
               # --- START OF CHANGES ---
             full_text_response = batch_response[j]

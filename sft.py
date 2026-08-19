@@ -12,6 +12,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import (
     Qwen2AudioForConditionalGeneration,
+    AudioFlamingo3ForConditionalGeneration,
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     AutoProcessor,
@@ -26,10 +27,12 @@ from transformers import (
 import datasets
 from trainer.sft_trainer import AudioSFTTrainer
 from trainer.vaccine_trainer import VaccineTrainer
-from trainer.balance_trainer import BalanceTrainer
 from trl.trainer.utils import (
     pad
 )
+import os 
+
+
 from dataset import CustomDataCollatorForSFT
 @dataclass
 class DataTrainingArguments:
@@ -55,9 +58,7 @@ class DataTrainingArguments:
     noise_lr: Optional[float] = field(default=0, metadata={"help":"noise lr"})
     rho: Optional[float] = field(default=0.1, metadata={"help":"noise level"})
     lamb: Optional[float] = field(default=0.1, metadata={"help":"balance level"})
-    orginal_model_path: Optional[str] = field(default="", metadata={"help":"original model"})
     learning_rate: Optional[float] = field(default=1e-5, metadata={"help":"learning rate"})
-    rebellion_enable: Optional[str] = field(default="False", metadata={"help":"rebellion"})
     # def __post_init__(self):
     #     if self.config_path is None:
     #         raise ValueError("config path should not none")
@@ -87,13 +88,11 @@ def main():
     data_seed=0,
     output_dir=data_args.out_dir,
     # num_train_epochs=3,
-    num_train_epochs=80,
+    num_train_epochs=10,
     #max_steps=1000,
     # per_device_eval_batch_size = 0,
     per_device_train_batch_size =1,
     gradient_accumulation_steps = 1,
-    warmup_ratio = 0.1,
-    logging_dir='./logs',
     learning_rate = data_args.learning_rate,
     logging_steps = 1,
     #evaluation_strategy="steps",
@@ -106,6 +105,7 @@ def main():
     #seed = 3407,
     save_strategy="no",
     #save_strategy="epoch",
+    # use_liger_loss=False,
     lr_scheduler_type = "cosine",
     #load_best_model_at_end=True,
     report_to=[],
@@ -117,13 +117,15 @@ def main():
     #     model = Qwen2AudioForConditionalGeneration.from_pretrained(data_args.model_name_or_path,torch_dtype=torch.bfloat16,attn_implementation="eager")
     # else:
     
-    
-    model = Qwen2AudioForConditionalGeneration.from_pretrained(data_args.model_name_or_path,torch_dtype=torch.bfloat16)
+    if "Qwen" in data_args.model_name_or_path:
+        model = Qwen2AudioForConditionalGeneration.from_pretrained(data_args.model_name_or_path,torch_dtype=torch.bfloat16)
+    else:
+        model = AudioFlamingo3ForConditionalGeneration.from_pretrained(data_args.model_name_or_path, torch_dtype=torch.bfloat16)
     # print(model)
     processor = AutoProcessor.from_pretrained(data_args.model_name_or_path)
     # processor.pad_token_id = processor.tokenizer.pad_token_id
     processor.eos_token_id = processor.tokenizer.eos_token_id
-
+    
     # # Use a token that is never used
     # processor.tokenizer.pad_token = "<|fim_pad|>"
 
@@ -146,20 +148,20 @@ def main():
         tokenizer=processor.tokenizer,
         mlm=False
     )
-
+    
     # train_dataset =datasets.load_dataset(data_args.data_file)["train"].select(range(2))
-    original_dataset =datasets.load_dataset(data_args.data_file)["train"].select(range(1))
-    alpaca_dataset = datasets.load_dataset("anonymous4486/audio_alpaca_train")["train"]
-    safe_dataset =datasets.load_dataset(data_args.safe_data_file)["train"].select(range(1))
-
-    # Merge the three datasets
-    merged_dataset = datasets.concatenate_datasets([original_dataset])
+    original_dataset =datasets.load_dataset(data_args.data_file)["train"].select(range(500))
+    alpaca_dataset = datasets.load_dataset("anonymous4486/audio_alpaca_train")["train"].select(range(500))
+    safe_dataset =datasets.load_dataset(data_args.safe_data_file)["train"].select(range(500))
+    # safe_dataset =datasets.load_dataset(data_args.safe_data_file)["train"].select(range(2))
+    # Merge the two datasets
+    merged_dataset = datasets.concatenate_datasets([original_dataset, alpaca_dataset])
 
     # harmful_dataset  =datasets.load_dataset(data_args.harmful_data_file)["train"].select(range(1))
     # print(train_dataset)
     
     # print(train_dataset)
-
+    training_args.loss_type = "nll"
     if data_args.method == "sft": 
         trainer = AudioSFTTrainer(
             # audio sft things
@@ -174,27 +176,27 @@ def main():
             processing_class= processor,
             data_collator=collator
         )
-    elif data_args.method =="balance":
-        training_args.rho=data_args.rho
-        training_args.lamb = data_args.lamb
-        training_args.rebellion_enable=data_args.rebellion_enable
-        trainer = BalanceTrainer(
-            original_dataset = merged_dataset,
-            processing_class= processor,
-            # rho = data_args.rho,
-            # noise_lr=data_args.noise_lr, 
-            # processor= processor,
-            # suffix_length= data_args.suffix_length, 
-            # # SFT things
-            safety_mixture=data_args.safety_mixture,
-            model=model,
-            # tokenizer=processor.tokenizer,
-            # tokenizer=processor.tokenizer,
-            args=training_args,
-            train_dataset=safe_dataset,
-            # eval_dataset=test_dataset,
-            data_collator=collator
-        )
+    # elif data_args.method =="balance":
+    #     training_args.rho=data_args.rho
+    #     training_args.lamb = data_args.lamb
+    #     training_args.rebellion_enable=data_args.rebellion_enable
+    #     trainer = BalanceTrainer(
+    #         original_dataset = merged_dataset,
+    #         processing_class= processor,
+    #         # rho = data_args.rho,
+    #         # noise_lr=data_args.noise_lr, 
+    #         # processor= processor,
+    #         # suffix_length= data_args.suffix_length, 
+    #         # # SFT things
+    #         safety_mixture=data_args.safety_mixture,
+    #         model=model,
+    #         # tokenizer=processor.tokenizer,
+    #         # tokenizer=processor.tokenizer,
+    #         args=training_args,
+    #         train_dataset=safe_dataset,
+    #         # eval_dataset=test_dataset,
+    #         data_collator=collator
+    #     )
     else:
         training_args.rho=data_args.rho
         trainer = VaccineTrainer(

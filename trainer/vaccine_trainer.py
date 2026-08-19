@@ -26,6 +26,7 @@ from transformers.models.llama.modeling_llama import LlamaAttention,LlamaMLP
 from transformers.models.qwen2_audio.modeling_qwen2_audio import Qwen2AudioAttention
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
 from transformers.models.opt.modeling_opt import OPTAttention
+from transformers.models.audioflamingo3.modeling_audioflamingo3 import AudioFlamingo3Attention
 import copy
 from .sft_trainer import AudioSFTTrainer
 if version.parse(torch.__version__) >= version.parse("1.6"):
@@ -46,7 +47,7 @@ def get_leaf_modules_with_grad(module):
     #     if "lora_B" in name and "v_proj" in name and len(list(module.children())) == 0:
     #         module_list+= [module]
     # or isinstance(module, LlamaMLP)
-        if isinstance(module,Qwen2AudioAttention) or isinstance(module,Qwen2Attention) or isinstance(module, OPTAttention):
+        if isinstance(module,Qwen2AudioAttention) or isinstance(module,Qwen2Attention) or isinstance(module, OPTAttention) or isinstance(module, AudioFlamingo3Attention):
             module_list+= [module]
     # # print(module_list)
     return module_list
@@ -87,6 +88,7 @@ class VaccineTrainer(AudioSFTTrainer):
         self.vaccine_state = {}
         self.vaccine_state ["hooks"] = []
         self.vaccine_state ["gradient"] = {}
+        # print(inputs)
         self.pre_first_step(model)
         step(inputs)
         self.after_first_step(model)

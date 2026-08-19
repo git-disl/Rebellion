@@ -3,7 +3,7 @@ from absl import app
 from absl import flags
 from absl import logging
 import torch
-from transformers import AutoProcessor, HfArgumentParser, Qwen2AudioForConditionalGeneration
+from transformers import AutoProcessor, HfArgumentParser, Qwen2AudioForConditionalGeneration,AudioFlamingo3ForConditionalGeneration
 import json
 from dataclasses import dataclass, field
 import torchaudio
@@ -54,7 +54,7 @@ def _get_message(obj_dict):
         {
             "role": "user",
             "content": [
-                {"type": "audio", "audio_url": obj_dict['audio']["path"]},
+                {"type": "audio", "audio_url": None},
                 {"type": "text", "text": _SYSTEM_PROMPT.value},
             ],
         }
@@ -118,18 +118,25 @@ def main(_):
     # logging.info("sssssas")
     if _CACHE_DIR.value!=None:
         if "JALMBench" in _DATA_DIR.value: 
-            dataset =datasets.load_dataset("AnonymousUser000/JALMBench","AdvWave", cache_dir=_CACHE_DIR.value)
+            # dataset =datasets.load_dataset("AnonymousUser000/JALMBench","AdvWave", cache_dir=_CACHE_DIR.value)
+            dataset = datasets.load_dataset(
+            "AnonymousUser000/JALMBench",
+            data_files={"train": "Audio_Originated_Jailbreak/AdvWave/*.parquet"}
+            )["train"].select(range(5000))
         else:
-            dataset =datasets.load_dataset(_DATA_DIR.value,cache_dir=_CACHE_DIR.value)
+            dataset =datasets.load_dataset(_DATA_DIR.value,cache_dir=_CACHE_DIR.value)["train"]
     else:
         if "JALMBench" in _DATA_DIR.value: 
-            dataset =datasets.load_dataset("AnonymousUser000/JALMBench","AdvWave")
+            dataset = datasets.load_dataset(
+            "AnonymousUser000/JALMBench",
+            data_files={"train": "Audio_Originated_Jailbreak/AdvWave/*.parquet"}
+            )["train"].select(range(5000))
         else:
-            dataset =datasets.load_dataset(_DATA_DIR.value)
+            dataset =datasets.load_dataset(_DATA_DIR.value)["train"]
     # logging.info("sssss")
     index=0
     datas = []
-    for example in dataset["train"]:
+    for example in dataset:
         # if index<100:
         instance = {}
         if "original_text" in example.keys(): 
