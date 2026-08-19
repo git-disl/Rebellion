@@ -528,7 +528,7 @@ def hf_save_adv(model_name, data_args, begin_index, end_index):
     from datasets import load_dataset
     from huggingface_hub import login
     # You might need to log in first if you haven't already
-    login(token="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") # Uncomment this and follow the prompts if needed
+    login(token="") # Uncomment this and follow the prompts if needed
     index=0
     data= []
     file_path = 'harmful_behaviors.csv'  # Replace with the path to your CSV file
@@ -555,7 +555,8 @@ def hf_save_original():
     from datasets import load_dataset
     from huggingface_hub import login
     # You might need to log in first if you haven't already
-    login(token="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") # Uncomment this and follow the prompts if needed
+
+    login(token="") # Uncomment this and follow the prompts if needed
     index=0
     data= []
     file_path = 'harmful_behaviors.csv'  # Replace with the path to your CSV file

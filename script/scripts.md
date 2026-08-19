@@ -11,7 +11,7 @@ from datasets import load_dataset
 ds = load_dataset("anonymous4486/audio_beavertail_30k_test", cache_dir="google/src/cloud/tianshenghuang/tiansheng2/google3/cache")
 
 
-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
+<!-- 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 -->
 
 <!-- mixed training -->
 sbatch grpo_safety_mix.sh 0

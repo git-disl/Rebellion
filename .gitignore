@@ -27,6 +27,7 @@ cache
 *.log
 
 *.out
+hf_token
 
 !script/rebuttal_gsm8k_benign/*.out
 
